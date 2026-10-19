@@ -1,0 +1,17 @@
+name: snapstore_auth
+description: >-
+  Dart FFI client for libsnapstore_auth — interactive Ubuntu One SSO
+  (email + password + 2FA) login with macaroon issuance for the Snap Store,
+  plus authenticated account / brand-store / signing-key API calls.
+version: 0.1.0
+repository: https://github.com/ogra1/snapstore-auth
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  # Transitive: needed by lib/src/snapstore_auth_client.dart (calloc, Utf8).
+  ffi: ^2.1.0
+
+dev_dependencies:
+  test: any

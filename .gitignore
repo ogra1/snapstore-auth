@@ -1,0 +1,7 @@
+# Rust
+/target/
+
+# Dart
+.dart_tool/
+.packages
+pubspec.lock
