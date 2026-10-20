@@ -13,6 +13,10 @@ Rust integration test / craft-store fixtures):
   GET  /dev/api/account            -> {"account_id", "account_keys": [...],
                                        "stores": [...], "snaps": [...]}
   POST /dev/api/account/account-key-> 200/401 (validates Authorization)
+  *    /__echo/<anything>          -> echoes {method, path, body, content_type}
+                                       (auth required; ?status=<code> picks
+                                       the response status — exercises the
+                                       generic auth_request escape hatch)
 
 Authenticated endpoints (whoami / account / account-key) require a
 `Macaroon root=..., discharge=...` Authorization header — requests without
@@ -157,9 +161,16 @@ def handle(conn: socket.socket) -> None:
                 break
             body += chunk
         body = body[:content_length].decode("utf-8", "replace")
-        payload = json.loads(body) if body else {}
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            # Non-JSON bodies are valid for /__echo (the generic
+            # auth_request escape hatch doesn't require JSON) — fall back
+            # to an empty payload for routes that expect JSON and let
+            # `route()` use the raw `body` string instead.
+            payload = {}
 
-        status, resp = route(method, path, headers, payload)
+        status, resp = route(method, path, headers, payload, body)
         resp_bytes = resp.encode("utf-8")
         reason = {
             200: "OK",
@@ -182,7 +193,9 @@ def handle(conn: socket.socket) -> None:
         conn.close()
 
 
-def route(method: str, path: str, headers: dict, payload: dict) -> tuple[int, str]:
+def route(
+    method: str, path: str, headers: dict, payload: dict, raw_body: str = ""
+) -> tuple[int, str]:
     # --- public (login flow) ---
     if method == "POST" and path == "/dev/api/acl/":
         # The current snap-store root-macaroon endpoint (U1_SNAP_STORE
@@ -246,6 +259,23 @@ def route(method: str, path: str, headers: dict, payload: dict) -> tuple[int, st
             )
         REGISTERED_KEYS.append(assertion)
         return 201, json.dumps({"status": "ok"})
+
+    if path.startswith("/__echo"):
+        # Generic arbitrary-endpoint echo for `auth_request` /
+        # `AuthRuntime::request` — exercises any HTTP verb/path/body/status
+        # combination the fixed helpers above don't cover. Not part of the
+        # real store API. Request: `METHOD /__echo/<anything>?status=<code>`.
+        clean_path, _, query = path.partition("?")
+        status = 200
+        for param in query.split("&"):
+            if param.startswith("status="):
+                status = int(param.split("=", 1)[1])
+        return status, json.dumps({
+            "method": method,
+            "path": clean_path,
+            "body": raw_body,
+            "content_type": headers.get("content-type", ""),
+        })
 
     return 404, json.dumps({"message": "not found"})
 

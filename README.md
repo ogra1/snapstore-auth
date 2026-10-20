@@ -79,6 +79,8 @@ Test-only control endpoints (not part of the real store API):
 - `POST /__reject` — toggle the reject-macaroon mode at runtime
   (log in against a healthy store, then simulate expiry)
 - `GET  /__registered` — the account-key assertions recorded so far
+- `*    /__echo/<anything>?status=<code>` — echoes
+  `{method, path, body, content_type}` (auth required)
 
 ## Versioning
 

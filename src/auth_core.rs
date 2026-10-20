@@ -116,6 +116,23 @@ pub struct AccountInfo {
     pub expires: String,
 }
 
+/// Raw result of [`AuthRuntime::request`] — the generic authenticated-call
+/// escape hatch.
+///
+/// Unlike the fixed-endpoint helpers ([`AuthRuntime::whoami`],
+/// [`AuthRuntime::account_info`], [`AuthRuntime::store_snaps`],
+/// [`AuthRuntime::register_key`]), this carries the HTTP response verbatim:
+/// no status-code or body interpretation happens here. Callers hitting
+/// store API paths this crate doesn't wrap directly decide for themselves
+/// what counts as success and how to parse the body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApiResponse {
+    /// HTTP status code, e.g. `200`, `404`.
+    pub status: u16,
+    /// Raw response body (not parsed — may be JSON, plain text, or empty).
+    pub body: String,
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -436,6 +453,52 @@ impl AuthRuntime {
             store_id
         );
         self.http_json(&url, Some(&header), None).await
+    }
+
+    /// Generic authenticated store API call — the escape hatch for apps
+    /// that need store endpoints beyond the fixed helpers above (`whoami`,
+    /// `account_info`, `store_snaps`, `register_key`).
+    ///
+    /// `path` is resolved against [`AuthConfig::store_url`] (leading slash
+    /// optional). `method` is any HTTP verb (`"GET"`, `"POST"`, `"PUT"`,
+    /// `"DELETE"`, ...). `body` is sent verbatim as the request body when
+    /// present; `content_type` defaults to `application/json` when absent.
+    /// The `Authorization` header is attached from the persisted
+    /// credentials, same as every other call in this module.
+    ///
+    /// This returns the raw `{status, body}` for **any** HTTP response,
+    /// 2xx or not — unlike the fixed helpers, it does not interpret or
+    /// validate the response. Only transport-level failures (DNS, TLS,
+    /// timeout, connection reset) are `Err`. The caller decides what a
+    /// successful call looks like.
+    pub async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<ApiResponse> {
+        let header = self.authorization_header()?;
+        let base = self.config.store_url.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        let url = format!("{base}/{path}");
+
+        let http_method = reqwest::Method::from_bytes(method.trim().to_uppercase().as_bytes())
+            .map_err(|e| AuthenticationError::InvalidResponse(format!("bad HTTP method: {e}")))?;
+
+        let mut req = self
+            .http
+            .request(http_method, &url)
+            .header("Authorization", header)
+            .header("Content-Type", content_type.unwrap_or("application/json"));
+        if let Some(b) = body {
+            req = req.body(b.to_string());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok(ApiResponse { status, body })
     }
 
     /// Import credentials previously exported with
