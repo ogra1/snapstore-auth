@@ -923,7 +923,14 @@ typedef TStoreSnapsDart = CString Function(OpaquePtr, CString, ErrOut);
 typedef TImportNative = Bool Function(OpaquePtr, CString, ErrOut);
 typedef TImportDart = bool Function(OpaquePtr, CString, ErrOut);
 
-/// Looked-up handles to the two extra C symbols. Resolved lazily so that
+// -- auth_request (CString out; method/path/body/content_type, the last two
+//    nullable) -------------------------------------------------------------
+typedef TRequestNative = CString Function(
+    OpaquePtr, CString, CString, CString, CString, ErrOut);
+typedef TRequestDart = CString Function(
+    OpaquePtr, CString, CString, CString, CString, ErrOut);
+
+/// Looked-up handles to the extra C symbols. Resolved lazily so that
 /// older `libsnapstore_auth` builds (without the symbols) still fail only
 /// when the extra functions are actually used.
 final class SnapstoreAuthExtras {
@@ -931,10 +938,13 @@ final class SnapstoreAuthExtras {
       : storeSnaps = snapstoreAuthLibrary.lookupFunction<TStoreSnapsNative,
               TStoreSnapsDart>('auth_store_snaps'),
         importExportedLogin = snapstoreAuthLibrary.lookupFunction<TImportNative,
-            TImportDart>('auth_import_exported_login');
+            TImportDart>('auth_import_exported_login'),
+        request = snapstoreAuthLibrary
+            .lookupFunction<TRequestNative, TRequestDart>('auth_request');
 
   final TStoreSnapsDart storeSnaps;
   final TImportDart importExportedLogin;
+  final TRequestDart request;
 
   static SnapstoreAuthExtras? _instance;
 
@@ -942,6 +952,23 @@ final class SnapstoreAuthExtras {
     _instance ??= SnapstoreAuthExtras._();
     return _instance!;
   }
+}
+
+/// Raw result of [SnapstoreAuthModelBuilder.request] — the generic
+/// authenticated-call escape hatch. Mirrors Rust's `ApiResponse`: the HTTP
+/// response is carried verbatim, 2xx or not, with no interpretation of the
+/// status or body — the caller decides what success means.
+final class StoreApiResponse {
+  const StoreApiResponse({required this.status, required this.body});
+
+  /// HTTP status code, e.g. `200`, `404`.
+  final int status;
+
+  /// Raw response body (not parsed — may be JSON, plain text, or empty).
+  final String body;
+
+  @override
+  String toString() => 'StoreApiResponse($status, ${body.length} bytes)';
 }
 
 extension SnapstoreAuthModelBuilder on SnapstoreAuth {
@@ -973,6 +1000,62 @@ extension SnapstoreAuthModelBuilder on SnapstoreAuth {
           detail: 'store snaps: expected a JSON object');
     }
     return v.cast<String, Object?>();
+  }
+
+  /// Generic authenticated store API call — the escape hatch for apps that
+  /// need store endpoints beyond the fixed helpers above ([whoami],
+  /// [storeSnapsRaw], `register_key`, etc.). `path` is resolved against the
+  /// configured store URL; `method` is any HTTP verb (`'GET'`, `'POST'`,
+  /// ...). `contentType` defaults to `application/json` when omitted.
+  ///
+  /// Returns the raw [StoreApiResponse] for **any** HTTP response, 2xx or
+  /// not — this call does not interpret or validate the response; the
+  /// caller decides what success means. Only transport-level failures
+  /// (DNS, TLS, timeout) throw [SnapstoreAuthError].
+  ///
+  /// Blocking (bounded by the Rust-side HTTP timeout) — call from a
+  /// background isolate:
+  /// ```dart
+  /// final resp = await Isolate.run(
+  ///     () => auth.request('GET', '/dev/api/account/snaps'));
+  /// ```
+  StoreApiResponse request(
+    String method,
+    String path, {
+    String? body,
+    String? contentType,
+  }) {
+    final ErrOut errOut = calloc.allocate<CString>(1);
+    final CString aMethod = _toCString(method);
+    final CString aPath = _toCString(path);
+    final CString aBody = body == null ? nullptr : _toCString(body);
+    final CString aContentType =
+        contentType == null ? nullptr : _toCString(contentType);
+    CString s;
+    try {
+      s = SnapstoreAuthExtras.instance
+          .request(_handle, aMethod, aPath, aBody, aContentType, errOut);
+    } finally {
+      _freeCString(aMethod);
+      _freeCString(aPath);
+      _freeCString(aBody);
+      _freeCString(aContentType);
+    }
+    if (s == nullptr) {
+      throw SnapstoreAuthError.from(_takeCString(_bindings, errOut.value));
+    }
+    final String out = _takeCString(_bindings, s)!;
+    calloc.free(errOut);
+    final Object? v = jsonDecode(out);
+    if (v is! Map || v['status'] is! int || v['body'] is! String) {
+      throw const SnapstoreAuthError(
+          kind: 'invalid_response',
+          detail: 'request: expected a JSON {status, body} object');
+    }
+    return StoreApiResponse(
+      status: v['status'] as int,
+      body: v['body'] as String,
+    );
   }
 
   /// Import a `snapcraft export-login --acls <acls> <file>` credential

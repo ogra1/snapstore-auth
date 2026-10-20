@@ -147,6 +147,29 @@ async fn handle_client(
             r#"{"account":{"id":"DEADBEEF1234","email":"test@example.com","username":"test","display-name":"Test User"},"permissions":["package_access"],"channels":null,"expires":"2026-10-15T12:00:00+00:00"}"#
                 .to_string(),
         ),
+        other if other.starts_with("/__echo") => {
+            // Generic arbitrary-endpoint echo, used to exercise
+            // `AuthRuntime::request` for any HTTP verb/path/body/status
+            // combination (not part of the real store API). Request:
+            // `METHOD /__echo/<anything>?status=<code>`.
+            let method = head.split(' ').next().unwrap_or("GET");
+            let status: u16 = other
+                .split_once("?status=")
+                .and_then(|(_, s)| s.parse().ok())
+                .unwrap_or(200);
+            let content_type = req_lower
+                .lines()
+                .find_map(|l| l.strip_prefix("content-type:"))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            let echoed = serde_json::json!({
+                "method": method,
+                "path": other.split('?').next().unwrap_or(other),
+                "body": body,
+                "content_type": content_type,
+            });
+            (status, echoed.to_string())
+        }
         _ => (404, r#"{"message": "not found"}"#.to_string()),
     };
 
@@ -226,11 +249,53 @@ async fn login_without_2fa_succeeds_and_persists() {
     assert_eq!(info.display_name, "Test User");
     assert_eq!(info.permissions, vec!["package_access"]);
 
+    // request(): the generic escape hatch returns raw status+body for any
+    // HTTP response (2xx or not), without interpreting it.
+    let ok = rt
+        .request("POST", "/__echo/custom?status=201", Some(r#"{"a":1}"#), None)
+        .await
+        .expect("request ok");
+    assert_eq!(ok.status, 201);
+    let echoed: serde_json::Value = serde_json::from_str(&ok.body).expect("echo json");
+    assert_eq!(echoed["method"], "POST");
+    assert_eq!(echoed["path"], "/__echo/custom");
+    assert_eq!(echoed["body"], r#"{"a":1}"#);
+    assert_eq!(echoed["content_type"], "application/json");
+
+    // Non-2xx is still `Ok` — the caller decides what success means.
+    let not_found = rt
+        .request("GET", "/does/not/exist", None, None)
+        .await
+        .expect("request not found");
+    assert_eq!(not_found.status, 404);
+
+    // Custom content-type and GET-with-no-body both pass through.
+    let custom_ct = rt
+        .request(
+            "PUT",
+            "/__echo/ct?status=200",
+            Some("plain"),
+            Some("text/plain"),
+        )
+        .await
+        .expect("request custom content-type");
+    assert_eq!(custom_ct.status, 200);
+    let echoed_ct: serde_json::Value =
+        serde_json::from_str(&custom_ct.body).expect("echo json");
+    assert_eq!(echoed_ct["method"], "PUT");
+    assert_eq!(echoed_ct["content_type"], "text/plain");
+    assert_eq!(echoed_ct["body"], "plain");
+
     // Logout clears storage.
     rt.logout().expect("logout");
     wait_for_state(&rt, &["idle"]).await;
     assert!(rt.authorization_header().is_err());
+
+    // request() requires persisted credentials, same as the other
+    // authenticated helpers.
+    assert!(rt.request("GET", "/__echo", None, None).await.is_err());
 }
+
 
 #[serial]
 #[serial]

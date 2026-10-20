@@ -58,7 +58,7 @@ pub mod state;
 pub mod storage;
 
 pub use auth_core::{
-    AccountInfo, AuthConfig, AuthRuntime, DEFAULT_LOGIN_URL, DEFAULT_PERMISSIONS,
+    AccountInfo, ApiResponse, AuthConfig, AuthRuntime, DEFAULT_LOGIN_URL, DEFAULT_PERMISSIONS,
     DEFAULT_STORAGE_KEY, DEFAULT_STORE_URL, DEFAULT_TTL, VIEW_PERMISSIONS,
 };
 pub use error::{AuthenticationError, Result};
@@ -111,6 +111,16 @@ unsafe fn arg(s: *const c_char) -> String {
         CStr::from_ptr(s)
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+/// Take an optional `*const c_char` argument (null → `None`, distinct from
+/// the empty string "" which means "explicitly empty").
+unsafe fn arg_opt(s: *const c_char) -> Option<String> {
+    if s.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(s).to_string_lossy().into_owned())
     }
 }
 
@@ -496,6 +506,61 @@ pub extern "C" fn auth_store_snaps(
             let v = rt.store_snaps(&store_id).await?;
             serde_json::to_string(&v).map_err(|e| {
                 AuthenticationError::InvalidResponse(format!("encode store snaps: {e}"))
+            })
+        })
+    })();
+    match result {
+        Ok(s) => to_cstring(&s),
+        Err(e) => {
+            if !out_err.is_null() {
+                unsafe { *out_err = to_cstring(&error_json(&e)) };
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Generic authenticated store API call — the escape hatch for apps that
+/// need store endpoints beyond the fixed helpers above (`auth_whoami`,
+/// `auth_account_info`, `auth_store_snaps`, `auth_register_key`).
+///
+/// `method` is any HTTP verb (`"GET"`, `"POST"`, ...); `path` is resolved
+/// against the configured store URL. `body` / `content_type` may be null
+/// (null `content_type` defaults to `application/json`; null `body` sends
+/// no request body). Blocking (bounded by the HTTP timeout) — call from a
+/// background isolate in Dart.
+///
+/// Returns JSON `{"status": <u16>, "body": "<raw response body>"}` for
+/// **any** HTTP response, 2xx or not — this call does not interpret or
+/// validate the response; the caller decides what success means. Only
+/// transport-level failures (DNS, TLS, timeout) populate `out_err`.
+#[no_mangle]
+pub extern "C" fn auth_request(
+    handle: *mut AuthRuntimeHandle,
+    method: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    content_type: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    let method = unsafe { arg(method) };
+    let path = unsafe { arg(path) };
+    let body = unsafe { arg_opt(body) };
+    let content_type = unsafe { arg_opt(content_type) };
+    let result: Result<String> = (|| {
+        let rt: &AuthRuntime = if handle.is_null() {
+            RUNTIME
+                .get()
+                .ok_or(AuthenticationError::NoActiveSession)?
+        } else {
+            unsafe { &*(handle as *const AuthRuntime) }
+        };
+        runtime::block_on(async move {
+            let resp = rt
+                .request(&method, &path, body.as_deref(), content_type.as_deref())
+                .await?;
+            serde_json::to_string(&resp).map_err(|e| {
+                AuthenticationError::InvalidResponse(format!("encode api response: {e}"))
             })
         })
     })();
